@@ -93,8 +93,7 @@ class RTRBM(RBM):
     def gibbs_sampling(
         self, v: torch.Tensor, h_prev: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Performs the whole Gibbs sampling procedure FOR ONE TIMESTEP.
-        """
+        """Runs one timestep of Gibbs sampling."""
         pos_hidden_probs, pos_hidden_states = self.hidden_sampling(v, h_prev)
         neg_hidden_states = pos_hidden_states
 
@@ -132,10 +131,7 @@ class RTRBM(RBM):
         return mse
 
     def fit_subseries(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Trains on ONE subseries, using independent CD-k per timestep for the cost
-        computation, but accumulating cost ACROSS THE WHOLE SUBSERIES
-        before a SINGLE backward() + optimizer step.
-        """
+        """Trains on one subseries via BPTT (single backward pass across timesteps)."""
         batch_size, seq_len, n_visible = sequence.shape
 
         h_prev = self.h0.unsqueeze(0).expand(batch_size, -1)
@@ -182,17 +178,16 @@ class RTRBM(RBM):
             dataset, batch_size=batch_size, shuffle=True, num_workers=0
         )
 
-        mse = torch.tensor(0.0)
+        mse = torch.tensor(0.0, device=self.device)
 
         for epoch in range(epochs):
             logger.info("Epoch %d/%d", epoch + 1, epochs)
 
             start = time.time()
-            mse = torch.tensor(0.0)
+            mse = torch.tensor(0.0, device=self.device)
 
             for samples, _ in tqdm(batches):
-                # samples shape: (batch, seq_len, n_visible)
-                # No reshape needed -- fit_subseries expects this shape.
+                # samples: (batch, seq_len, n_visible)
                 if self.device == "cuda":
                     samples = samples.cuda()
 
@@ -208,3 +203,29 @@ class RTRBM(RBM):
             logger.info("MSE: %f", mse)
 
         return mse
+
+    def sample(
+        self, n_samples: int = 1, n_steps: int = 10, gibbs_steps: int = 100
+    ) -> torch.Tensor:
+        """Generates sequences via per-timestep Gibbs burn-in (Algorithm 3, Sutskever et al. 2008)."""
+        with torch.no_grad():
+            h_prev = self.h0.unsqueeze(0).expand(n_samples, -1)
+
+            all_visible = []
+
+            for t in range(n_steps):
+                h = torch.bernoulli(
+                    torch.full(
+                        (n_samples, self.n_hidden), 0.5, device=h_prev.device
+                    )
+                )
+                for _ in range(gibbs_steps):
+                    _, v = self.visible_sampling(h)
+                    _, h = self.hidden_sampling(v, h_prev)
+                v_t = v
+
+                all_visible.append(v_t.unsqueeze(1))
+
+                h_prev, _ = self.hidden_sampling(v_t, h_prev)
+
+            return torch.cat(all_visible, dim=1)

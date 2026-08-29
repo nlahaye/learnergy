@@ -1,14 +1,4 @@
-"""Recurrent Temporal Deep Belief Network (RTDBN).
-
-- Each layer is an RTRBM (specifically RTVarianceGaussianRBM by default)
-- forward() returns temporal embeddings via mean pooling over the time
-  axis, collapsing (batch, seq_len, n_hidden) -> (batch, n_hidden)
-- fit() trains each layer on sequences
-
-Clustering head and training wrapper live in SIT-FUSE:
-  sit_fuse.models.encoders.rtdbn_pl (encoder wrapper)
-  sit_fuse.models.deep_cluster.rtdbn_dc (clustering head + IIC loss)
-"""
+"""Recurrent Temporal Deep Belief Network: stacked RTRBM layers with mean-pooled temporal embeddings."""
 from typing import List, Optional, Tuple
 
 import torch
@@ -18,7 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import learnergy.utils.exception as e
-from learnergy.core import Model
+from learnergy.core import Dataset, Model
 from learnergy.utils import logging
 
 from learnergy.models.temporal.rt_variance_gaussian_rbm import RTVarianceGaussianRBM
@@ -118,32 +108,48 @@ class RTDBN(Model):
             raise e.ValueError("`n_layers` should be > 0")
         self._n_layers = n_layers
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encodes sequences through all RTRBM layers and returns
-        temporal embeddings via mean pooling over the time axis.
-
-        Args:
-            x: Input sequences, shape (batch, seq_len, n_visible).
-
-        Returns:
-            Temporal embeddings, shape (batch, n_hidden[-1]).
+    def sample(
+        self, n_samples: int = 1, n_steps: int = 10, gibbs_steps: int = 100
+    ) -> torch.Tensor:
+        """Generates sequences via Gibbs sampling at the top layer, then a
+        single top-down ancestral pass through the frozen lower layers
+        (standard DBN generation, per-timestep since visible_sampling
+        carries no recurrent state). Reduces to the old single-layer
+        delegation when n_layers == 1.
         """
+        with torch.no_grad():
+            current = self.models[-1].sample(
+                n_samples=n_samples, n_steps=n_steps, gibbs_steps=gibbs_steps
+            )
+
+            for i in range(self.n_layers - 2, -1, -1):
+                current = self._decode_sequence(self.models[i], current)
+
+        return current
+
+    def _decode_sequence(
+        self, model: torch.nn.Module, hidden_seq: torch.Tensor
+    ) -> torch.Tensor:
+        """Single ancestral pass: applies a frozen layer's visible_sampling
+        per timestep to map its hidden-space sequence down to its visible space.
+        """
+        outputs = []
+        for t in range(hidden_seq.shape[1]):
+            states, _ = model.visible_sampling(hidden_seq[:, t, :])
+            outputs.append(states.unsqueeze(1))
+
+        return torch.cat(outputs, dim=1)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encodes sequences through all RTRBM layers, mean-pooled over time."""
         h = x
         for model in self.models:
             h = model.forward(h)  # (batch, seq_len, n_hidden_i)
 
-        # Mean pool over time: (batch, seq_len, n_hidden) -> (batch, n_hidden)
         return h.mean(dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Full forward pass returning temporal embeddings.
-
-        Args:
-            x: Input sequences, shape (batch, seq_len, n_visible).
-
-        Returns:
-            Temporal embeddings, shape (batch, n_hidden[-1]).
-        """
+        """Full forward pass returning temporal embeddings."""
         return self.encode(x)
 
     def fit(
@@ -153,16 +159,9 @@ class RTDBN(Model):
         epochs: Tuple[int, ...] = (30,),
         warmup_epochs: Tuple[int, ...] = (15,),
     ) -> List[torch.Tensor]:
-        """Trains each RTRBM layer sequentially.
-
-        Args:
-            dataset: Dataset where each sample is (seq_len, n_visible).
-            batch_size: Batch size.
-            epochs: Training epochs per layer.
-            warmup_epochs: Sigma warmup epochs per layer.
-
-        Returns:
-            List of final MSE per layer.
+        """Trains each RTRBM layer via greedy layer-wise pre-training: each
+        layer trains to convergence, freezes, then its hidden output becomes
+        the next layer's training data.
         """
         if len(epochs) != self.n_layers:
             raise e.SizeError(
@@ -170,27 +169,59 @@ class RTDBN(Model):
             )
 
         mse_per_layer = []
+        current_dataset = dataset
 
         for i, model in enumerate(self.models):
             logger.info("Fitting RTDBN layer %d/%d ...", i + 1, self.n_layers)
 
-            if i == 0:
-                warmup = warmup_epochs[i] if i < len(warmup_epochs) else 0
-                full = epochs[i] - warmup
+            has_sigma = hasattr(model, "sigma")
+            warmup = (warmup_epochs[i] if i < len(warmup_epochs) else 0) if has_sigma else 0
+            full = epochs[i] - warmup
 
-                if warmup > 0:
-                    model.sigma.requires_grad_(False)
-                    model.fit(dataset, batch_size=batch_size, epochs=warmup)
-
+            if warmup > 0:
+                model.sigma.requires_grad_(False)
+                model.fit(current_dataset, batch_size=batch_size, epochs=warmup)
                 model.sigma.requires_grad_(True)
-                model.fit(dataset, batch_size=batch_size, epochs=full)
+            elif has_sigma:
+                model.sigma.requires_grad_(True)
 
-                mse_per_layer.append(model.history["mse"][-1])
+            model.fit(current_dataset, batch_size=batch_size, epochs=full)
 
-            else:
-                raise NotImplementedError(
-                    "Multi-layer RTDBN training not yet implemented. "
-                    "Use n_hidden=(64,) for the single-layer configuration."
-                )
+            mse_per_layer.append(model.history["mse"][-1])
+
+            if i < self.n_layers - 1:
+                for param in model.parameters():
+                    param.requires_grad_(False)
+                current_dataset = self._encode_dataset(current_dataset, model, batch_size)
+
+        for model in self.models:
+            for param in model.parameters():
+                param.requires_grad_(True)
 
         return mse_per_layer
+
+    def _encode_dataset(
+        self, dataset: torch.utils.data.Dataset, model: torch.nn.Module, batch_size: int
+    ) -> Dataset:
+        """Encodes a dataset once through a frozen layer to build the next
+        layer's training data; torch.no_grad() avoids an autograd graph
+        through the frozen params.
+        """
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+        model.eval()
+        all_encoded = []
+        all_targets = []
+        with torch.no_grad():
+            for samples, targets in loader:
+                if self.device == "cuda":
+                    samples = samples.cuda()
+                encoded = model.forward(samples)  # (batch, seq_len, n_hidden_i)
+                all_encoded.append(encoded.cpu())
+                all_targets.append(targets)
+        model.train()
+
+        encoded_data = torch.cat(all_encoded, dim=0)
+        targets_data = torch.cat(all_targets, dim=0)
+
+        return Dataset(encoded_data, targets_data, None, show_log=False)
